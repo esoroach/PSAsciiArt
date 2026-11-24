@@ -1,0 +1,266 @@
+# ASCII Clownfish V4.2 - partial C# port; physical swimmer and screen-space tube renderer.
+# Source Idea: https://github.com/sapozhkov/ascii-lab-public/blob/main/01-clownfish/clownfish.py
+# Windows PowerShell 5.1 / PowerShell 7 on Windows. Window mode requires STA.
+
+[CmdletBinding()]
+param(
+ [ValidateSet('Terminal','Window')][string]$Mode='Window',
+ [ValidateRange(5,60)][int]$FPS=30,
+ [ValidateRange(0,86400)][int]$Duration=0,
+ [ValidateRange(40,180)][int]$Width=90,
+ [ValidateRange(25,160)][int]$Height=72,
+ [switch]$SelfTest,
+ [switch]$Diagnostics,
+ [switch]$NoGlow
+)
+function Show-AsciiClownfish {
+ [CmdletBinding()]
+ param(
+  [ValidateSet('Terminal','Window')][string]$Mode='Window',
+  [ValidateRange(5,60)][int]$FPS=30,
+  [ValidateRange(0,86400)][int]$Duration=0,
+  [ValidateRange(40,180)][int]$Width=90,
+  [ValidateRange(25,160)][int]$Height=72,
+ [switch]$SelfTest,
+ [switch]$Diagnostics,
+ [switch]$NoGlow
+ )
+ if (-not ('ClownfishV42.Renderer' -as [type])) {
+ Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Text;
+namespace ClownfishV42 {
+ public struct V {
+  public double X,Y,Z;
+  public V(double x,double y,double z){X=x;Y=y;Z=z;}
+  public static V operator +(V a,V b){return new V(a.X+b.X,a.Y+b.Y,a.Z+b.Z);}
+  public static V operator -(V a,V b){return new V(a.X-b.X,a.Y-b.Y,a.Z-b.Z);}
+  public static V operator *(V a,double b){return new V(a.X*b,a.Y*b,a.Z*b);}
+  public double Dot(V b){return X*b.X+Y*b.Y+Z*b.Z;}
+  public double Len(){return Math.Sqrt(Dot(this));}
+  public V Unit(){return this*(1/Math.Max(1e-9,Len()));}
+  public V Cross(V b){return new V(Y*b.Z-Z*b.Y,Z*b.X-X*b.Z,X*b.Y-Y*b.X);}
+ }
+ public class FrameStats {
+  public double Next=0, Start=0, Total=0, Worst=0, Geo=0, Pixel=0, Present=0; public int Count=0;
+  public bool Due(double now,int fps){if(now+0.001<Next)return false;Next+=1.0/fps;if(Next<now-1.0/fps)Next=now+1.0/fps;return true;}
+  public string Record(double now,double work,double geo,double pixel,double present){Count++;Total+=work;Geo+=geo;Pixel+=pixel;Present+=present;Worst=Math.Max(Worst,work);double span=now-Start;if(span<1)return null;string result=String.Format("{0:F1} updates/s | render {1:F1} ms avg / {2:F1} ms max",Count/span,1000*Total/Count,1000*Worst)+String.Format(" | 3D {0:F1} / pixels {1:F1} / output {2:F1} ms",1000*Geo/Count,1000*Pixel/Count,1000*Present/Count);Start=now;Count=0;Total=Worst=Geo=Pixel=Present=0;return result;}
+ }
+ public class Renderer {
+  const double PI=Math.PI, Tau=2*Math.PI, Loop=22;
+  const string Ramp="$QB%8&0#@oauenjzt[]{}<>rcvx+=1il!;:,";
+  static readonly double[] S={0,.03,.08,.16,.30,.45,.60,.75,.88,.96,1};
+  static readonly double[] H={0,.075,.125,.175,.222,.238,.218,.165,.10,.078,.075};
+  static readonly V Light=new V(-.45,.75,-.48).Unit();
+  static readonly V Orange=new V(255,122,22), Deep=new V(238,66,18), Face=new V(255,168,52), White=new V(250,248,240), Dark=new V(84,62,112), Rim=new V(205,222,255);
+  static readonly V[] Path={new V(1.25,.66,.62),new V(.16,.05,.27),new V(.04,.01,.10),new V(.22,0,.04),new V(.30,.04,.24),new V(-.50,.42,.02),new V(-1.30,.14,-.38),new V(-1.72,-.28,-.80),new V(-1.30,-.58,-1.08),new V(-.70,-.50,-1.14),new V(.30,-.42,-1.10),new V(1.50,-.10,-.60),new V(1.85,.35,.10)};
+  public readonly int W,Ht; public readonly char[] Ch; public readonly int[] Ink;
+  readonly double[] depth; readonly byte[] owner;
+  readonly V[,] rest=new V[50,14]; readonly V[,] nodes=new V[50,14]; readonly V[] motes=new V[470];
+  readonly double[] phase=new double[50], phase2=new double[50]; readonly double[,] touch=new double[50,14];
+  double time,yaw,pitch,effort,beat,turn,scale,hz,brake; double[] spine=new double[76]; SwimState[] track; public double lapSeconds; V place,cam;
+  double swing,tilt,cyaw,syaw,cpitch,spitch,cswing,sswing,ctilt,stilt; V centre;
+  public Renderer(int w,int h){W=w;Ht=h;Ch=new char[w*h];Ink=new int[w*h];depth=new double[w*h];owner=new byte[w*h];tubeBest=new double[w*h];tubeIndex=new int[w*h];
+   BuildTrack(); Random r=new Random(11);for(int i=0;i<50;i++){
+    double lon=r.NextDouble()*Tau,lat=.06+1.12*Math.Pow(r.NextDouble(),1.15),len=.60+.42*r.NextDouble();
+    V n=new V(Math.Sin(lat)*Math.Cos(lon),Math.Cos(lat),Math.Sin(lat)*Math.Sin(lon));
+    V root=new V(.05,-1.02,.40)+new V(n.X*1.10,n.Y*.36,n.Z*.80);
+    V aim=new V(n.X*1.05,Math.Max(.30,n.Y*.70+.42),n.Z).Unit(); V side=aim.Cross(new V(0,0,1)).Unit(), fore=aim.Cross(side);
+    V bend=side*(r.NextDouble()-.5)*1.5+fore*(r.NextDouble()-.5)*1.5;phase[i]=r.NextDouble()*Tau;phase2[i]=r.NextDouble()*Tau;
+    for(int j=0;j<14;j++){double u=j/13.0;rest[i,j]=root+(aim*u+bend*(u*u-.55*u*u*u)*2.2)*len+new V(0,.2*len*u*u,0);}
+   }
+   for(int i=0;i<motes.Length;i++)motes[i]=new V(r.NextDouble()*6-3,r.NextDouble()*2.25-1.25,r.NextDouble()*2.9-1.7);
+  }
+  static double Clamp(double a,double lo,double hi){return Math.Max(lo,Math.Min(hi,a));}
+  static double Ease(double a){a=Clamp(a,0,1);return a*a*(3-2*a);}
+  static V Mix(V a,V b,double u){return a*(1-u)+b*u;}
+  static double Height(double s){s=Clamp(s,0,1);int i=0;while(i<S.Length-2&&s>S[i+1])i++;return H[i]+(H[i+1]-H[i])*(s-S[i])/(S[i+1]-S[i]);}
+  static double Width(double s){return Height(s)*(.58-.22*s);}
+  static V RY(V p,double a){double c=Math.Cos(a),s=Math.Sin(a);return new V(c*p.X+s*p.Z,p.Y,-s*p.X+c*p.Z);}
+  static V RZ(V p,double a){double c=Math.Cos(a),s=Math.Sin(a);return new V(c*p.X-s*p.Y,s*p.X+c*p.Y,p.Z);}
+  static V RX(V p,double a){double c=Math.Cos(a),s=Math.Sin(a);return new V(p.X,c*p.Y-s*p.Z,s*p.Y+c*p.Z);}
+  static int RGB(V c){return ((int)Clamp(c.X,0,255)<<16)|((int)Clamp(c.Y,0,255)<<8)|(int)Clamp(c.Z,0,255);}
+  static char Glyph(double lum){return Ramp[(int)Clamp(Math.Pow(1-Clamp(lum,0,1),1.3)*(Ramp.Length-1),0,Ramp.Length-1)];}
+  static char Direction(double dx,double dy){if(Math.Abs(dy)>2*Math.Abs(dx))return '|';if(Math.Abs(dx)>2*Math.Abs(dy))return '-';return dx*dy<0?'/':'\\';}
+  struct SwimState {public V P,Food; public double A,T,V,E,Phi,Age;}
+  static V FoodAt(double age){return new V(-.02-.020*age+.035*Math.Sin(2.3*age),-.17-.055*age,-1.14+.02*Math.Sin(1.7*age+1));}
+  void BuildTrack(){
+   // Tail thrust, quadratic water resistance, steering and prey pursuit.
+   double[] power={.75,.65,.55,.55,.55,.55,.65,.60,.80,2.10,1.15,.95,.60};
+   double[] near={.34,.16,.15,.15,.15,.30,.34,.30,.30,.30,.34,.34,.30};
+   var log=new System.Collections.Generic.List<SwimState>();var homes=new System.Collections.Generic.List<int>();
+   V p=Path[5];double a=PI+.5,th=0,v=0,e=0,phi=0,restTime=0,circling=0,food=-1,stare=0;int k=6;const double dt=1.0/60;
+   for(int n=0;n<14400&&homes.Count<3;n++){
+    int mark=restTime>0?(k+1)%13:k;bool hunting=k==9&&food>=0&&restTime<=0;if(food>=0)food+=dt;
+    V to=(hunting?FoodAt(food):Path[mark])-p;double dist=to.Len(),want=0;
+    V mouth=p+new V(Math.Cos(a)*Math.Cos(th),Math.Sin(th),Math.Sin(a)*Math.Cos(th))*.45;
+    if(restTime>0){restTime-=dt;if(restTime<=0)k=(k+1)%13;}
+    else {want=power[mark]*(mark==4?Clamp(dist/.35,.5,1):1);if(hunting&&stare>0){stare-=dt;want=.05;}
+     double ahead=to.X*Math.Cos(a)+to.Z*Math.Sin(a);circling=dist<3*near[mark]?circling+dt:0;
+     if((hunting?(FoodAt(food)-mouth).Len()<.12:dist<near[mark])||(mark==4&&dist<2.5*near[mark]&&ahead<0)||circling>1.4){circling=0;if(hunting)food=-1;else if(k==6)food=0;if(k==5)homes.Add(log.Count);restTime=mark==4?.25:0;if(restTime<=0){k=(k+1)%13;stare=k==9&&food>=0?.55:0;}}
+    }
+    double swing=Math.Atan2(to.Z,to.X)-a;swing=Math.Atan2(Math.Sin(swing),Math.Cos(swing));double eager=restTime>0?.35:.5+2.4*e;if(stare>0)eager=Math.Max(eager,2.2);
+    want*=.40+.60*Math.Pow(Math.Max(Math.Cos(swing),0),2);a+=Clamp(swing*eager,-1.9,1.9)*dt;
+    th+=(.8*Math.Asin(Clamp(to.Y/Math.Max(dist,1e-6),-.6,.6))*(restTime>0?.25:1)-th)*.7*eager*dt;
+    e+=(want-e)*(want<e?2.2:1.1+2.2*Math.Max(want-1.2,0))*dt;phi+=Tau*(.70+1.05*e)*dt;
+    v+=(2.1*e*(.30+.70*Math.Pow(Math.Sin(phi-.9),2))-2.2*v*Math.Abs(v)-.6*v)*dt;
+    p+=new V(Math.Cos(a)*Math.Cos(th),Math.Sin(th),Math.Sin(a)*Math.Cos(th))*(v*dt);
+    log.Add(new SwimState{P=p,A=a,T=th,V=v,E=e,Phi=phi,Age=food,Food=food>=0?FoodAt(food):p});
+   }
+   if(homes.Count<3)throw new InvalidOperationException("Swimmer did not complete three laps.");
+   int first=homes[1],last=homes[2],count=last-first,cut=0;
+   for(int i=0;i<count-1;i++){var q=log[first+i];if(q.P.X>1.05&&log[first+i+1].P.X<=1.05&&Math.Cos(q.A)<0&&q.P.Y>.2){cut=i;break;}}
+   lapSeconds=count/60.0;track=new SwimState[count];double da=log[last].A-log[first].A,dp=log[last].Phi-log[first].Phi;
+   for(int i=0;i<count;i++){int j=i+cut;var q=log[first+j%count];if(j>=count){q.A+=da;q.Phi+=dp;}q.Phi+=(Math.Round(dp/Tau)*Tau-dp)*i/count;track[i]=q;}
+  }
+  SwimState At(double t){double f=((t%Loop+Loop)%Loop)/Loop*track.Length;int i=(int)f;double u=f-i;var a=track[i];var b=track[(i+1)%track.Length];double angle=Math.Atan2(Math.Sin(b.A-a.A),Math.Cos(b.A-a.A));double ph=Math.Atan2(Math.Sin(b.Phi-a.Phi),Math.Cos(b.Phi-a.Phi));return new SwimState{P=Mix(a.P,b.P,u),A=a.A+angle*u,T=a.T+(b.T-a.T)*u,V=a.V+(b.V-a.V)*u,E=a.E+(b.E-a.E)*u,Phi=a.Phi+ph*u,Age=a.Age,Food=Mix(a.Food,b.Food,u)};}
+  V Curve(double t){return At(t).P;}
+  double Sway(double s,double lag){return effort*(.014+.105*s*s)*Math.Sin(beat-Tau*Math.Min(hz,1)*lag-3.4*s)+turn*(s-.25)*Math.Abs(s-.25);}
+  V RotateFish(V p){double x=cpitch*p.X-spitch*p.Y,y=spitch*p.X+cpitch*p.Y;return new V(cyaw*x+syaw*p.Z,y,-syaw*x+cyaw*p.Z);}
+  double Reach(double s){double k=Clamp(s,0,1.5)/.02;int i=Math.Min(74,(int)k);return spine[i]+(spine[i+1]-spine[i])*(k-i);}
+  V Pose(V p){p.X=p.X>.53?Reach(.98)-.45+p.X-.53:Reach(p.X+.45)-.45;return RotateFish(p)+place;}
+  V View(V p){double x=p.X-.05,y=p.Y+.55,z=p.Z-.40;double a=cswing*x+sswing*z,b=-sswing*x+cswing*z;return new V(a+.05,ctilt*y-stilt*b-.55,stilt*y+ctilt*b+.40);}
+  V Project(V p){p=View(p);double f=scale*7/(7+p.Z);return new V(W*.5+f*(p.X-centre.X),Ht*.49-f*(p.Y-centre.Y)*.667,p.Z);}
+  void Put(V p,char ch,V col,byte who){V q=Project(p);PutScreen(q,ch,col,who);}
+  void PutScreen(V q,char ch,V col,byte who){int x=(int)Math.Floor(q.X),y=(int)Math.Floor(q.Y);if(x<0||x>=W||y<0||y>=Ht)return;int i=y*W+x;if(q.Z>=depth[i])return;depth[i]=q.Z;Ch[i]=ch;Ink[i]=RGB(col);owner[i]=who;}
+  void Fin(V p,V ray,double b,double margin,double rim){V q=Project(Pose(p)),z=Project(Pose(p+ray*.03));V col=b>rim?Rim:b>margin?Dark:Mix(Orange,Face,.06);PutScreen(q,Direction(z.X-q.X,z.Y-q.Y),col*.92,2);}
+  static readonly V HalfLight=(Light+new V(0,0,-1)).Unit();
+  readonly double[] beamFoot=new double[6],beamWide=new double[6],beamAmp=new double[6];
+  readonly V[] tubeQ=new V[90]; readonly double[] tubeRad=new double[90];
+  readonly double[] tubeBest; readonly int[] tubeIndex;
+  static readonly double[] bodySin=Trig(true),bodyCos=Trig(false);
+  static double[] Trig(bool sin){double[] a=new double[120];for(int j=0;j<a.Length;j++)a[j]=sin?Math.Sin(Tau*j/120):Math.Cos(Tau*j/120);return a;}
+  readonly double[] tailFar=new double[46],tailSide=new double[46];
+  void Fish(){
+   double faceShine=.25+.75*Ease((-RotateFish(new V(-1,0,0)).Z-.35)/.45);
+   for(int i=0;i<280;i++){double s=i/279.0,h=Height(s),w=Width(s),sl=(Height(s+.004)-Height(s-.004))/.008,sw=Sway(s,0);
+    for(int j=0;j<120;j++){double v=bodySin[j],z=bodyCos[j];V p=new V(s-.45,h*v,w*z+sw);V projected=Project(Pose(p));
+     int px=(int)Math.Floor(projected.X),py=(int)Math.Floor(projected.Y);if(px<0||px>=W||py<0||py>=Ht||projected.Z>=depth[py*W+px])continue;
+     V normal=RotateFish(new V(-sl*w,w*v,h*z).Unit());double lit=Clamp(normal.Dot(Light),0,1),shine=Math.Pow(Clamp(normal.Dot(HalfLight),0,1),14)*faceShine;
+     double bulge=Math.Exp(-Math.Pow(v/.55,2));double a1=.215+.035*v*v,b1=.335+.02*v*v,a2=.515-.055*bulge,b2=.655-.02*bulge;
+     bool white=(s>a1&&s<b1)||(s>a2&&s<b2)||(s>.905&&s<.985);bool edge=(s>a1-.016&&s<b1+.016)||(s>a2-.016&&s<b2+.016)||(s>.889&&s<1.001);
+     V col=Mix(Orange,Deep,.5*Ease(v*.9));if(s<.2)col=Mix(col,Face,.55);double lum;
+     if(white){col=White*(.82+.18*lit);lum=.86+.14*lit;}else if(edge){col=Dark;lum=.42;shine=0;}else{col=col*(.42+.58*lit);lum=.66+.30*lit;}
+     PutScreen(projected,Glyph(lum+.3*shine),col+new V(191,191,191)*shine,1);
+    }
+   }
+   for(int l=0;l<3;l++)for(int i=0;i<110;i++){double a=i/109.0,s=(l==0?.25:l==1?.53:.62)+(l==0?.32:l==1?.35:.25)*a,reach=(l==0?.15:l==1?.125:.135)*Math.Pow(Math.Max(0,Math.Sin(PI*(l==2?.1+.9*a:Math.Pow(a,.8)))),.8),sign=l==2?-1:1,lean=l==0?.45:l==1?.85:.7;V ray=new V(lean,sign,0).Unit();for(int j=0;j<30;j++){double b=j/29.0,x=s-.45+lean*reach*b;V p=new V(x,sign*(Height(s)*.93+reach*b),Sway(x+.45,.16*b)+.05*Math.Pow(b,1.5)*Math.Sin(Tau*1.1*time-8*a-l*3));Fin(p,ray,b,l==2?.72:.84,.96);}}
+   double[] far=tailFar,sideways=tailSide;far[0]=sideways[0]=0;for(int j=1;j<46;j++){double u=j/45.0,ss=.98+.31*u;double slope=(Sway(ss+.003,.12*(u+.003/.31))-Sway(ss-.003,.12*(u-.003/.31)))/.006;double bend=Clamp(Math.Atan(slope*(1+.3*u)),-.95,.95);far[j]=far[j-1]+Math.Cos(bend)/45;sideways[j]=sideways[j-1]+Math.Sin(bend)/45;}
+   for(int i=0;i<110;i++){double a=2*i/109.0-1,phi=.95*a,span=.31*(1-.13*a*a);for(int j=0;j<46;j++){double b=j/45.0;V ray=new V(Math.Cos(phi),Math.Sin(phi),0);double x=.53+span*far[j]*ray.X,y=.075*a*(1-b)+span*b*ray.Y;Fin(new V(x,y,Sway(.98,0)+span*sideways[j]+.03*b*b*Math.Sin(Tau*.95*time-4.2+2.5*Math.Abs(a))),ray,b,.76,.94);}}
+   for(int side=-1;side<=1;side+=2){
+    for(int i=0;i<46;i++)for(int j=0;j<26;j++){double a=i/45.0,b=j/25.0,s=.37+.09*a,r=.17*(.55+.45*Math.Pow(Math.Sin(PI*a),.7));V ray=new V(.55,-1,side*.25);V p=new V(s-.45,-Height(s)*.9,side*.04)+ray*(r*b);p.Z+=Sway(s,.2*b);Fin(p,ray.Unit(),b,.78,2);}
+    for(int i=0;i<70;i++)for(int j=0;j<36;j++){double a=2*i/69.0-1,b=j/35.0,beta=Tau*1.3*time+(side>0?0:2.2)-2.1*b-.5*Math.Abs(a),open=.72-.20*Math.Min(effort-.55,1)+.55*brake+(.48-.14*Math.Min(effort-.55,1))*(Math.Sin(beta)+.25*Math.Sin(2*beta+.6));V axis=new V(.72*Math.Cos(open),-.69*Math.Cos(open),side*Math.Sin(open)),ray=axis*Math.Cos(.8*a)+new V(.69,.72,0)*Math.Sin(.8*a);V p=new V(-.075,-.07,side*Width(.375)*.9)+ray*(b*.21*(1-.12*a*a));p.Z+=Sway(.375,.1*b)-side*.07*b*b*Math.Cos(beta);Fin(p,ray,b,.74,.93);}
+    for(int i=0;i<12;i++)for(int j=0;j<40;j++){double u=i/11.0,k=Tau*j/40,s=.115+.041*u*Math.Cos(k),y=.05+.041*u*Math.Sin(k),h=Height(s),z=side*(Width(s)*Math.Sqrt(Clamp(1-y*y/(h*h),.05,1))+.03);V col=u<.6?new V(58,34,30):new V(255,190,96);if(u>.15&&u<.42&&Math.Abs(k-2.2)<.45)col=new V(235,225,215);Put(Pose(new V(s-.45,y,z+Sway(s,0))),Glyph(u<.6?.62:.72),col,1);}
+   }
+  }
+  void Reef(){
+   for(int i=0;i<50;i++){
+    for(int j=0;j<14;j++){double u=j/13.0;V p=rest[i,j]+new V(.16*Math.Sin(3*Tau*time/Loop-1.3*rest[i,j].X)+.12*Math.Sin((4+i%5)*Tau*time/Loop+phase[i]-5*u),.04*Math.Sin(4*Tau*time/Loop+phase2[i]-3*u),.11*Math.Cos((4+(i+2)%5)*Tau*time/Loop+phase2[i]-4*u))*u*u;
+     // Push the flexible arm outside an ellipsoid around the fish. Preserve link lengths approximately.
+     V local=RZ(RY(p-place,-yaw),-pitch)-new V(.08,0,0);V e=new V(local.X/.64,local.Y/.34,local.Z/.21);double d=e.Len();touch[i,j]=j==0?0:Clamp((1.2-d)*1.6,0,1);if(d<1&&j>0){if(d<1e-6)e=new V(0,1,0);else e=e*(1/d);p=Pose(new V(e.X*.64+.08,e.Y*.34,e.Z*.21));}if(j>0){V prev=nodes[i,j-1],delta=p-prev;double len=(rest[i,j]-rest[i,j-1]).Len();p=prev+delta.Unit()*len;}nodes[i,j]=p;
+    }
+    V[] q=tubeQ;double[] rad=tubeRad;int minx=W,maxx=0,miny=Ht,maxy=0;
+    for(int j=0;j<90;j++){double u=j/89.0,k=u*13;int a=Math.Min(12,(int)k);double b=k-a;V p0=nodes[i,a],p1=nodes[i,a+1],m0=(p1-nodes[i,Math.Max(0,a-1)])*.5,m1=(nodes[i,Math.Min(13,a+2)]-p0)*.5;
+     V p=p0*(2*b*b*b-3*b*b+1)+m0*(b*b*b-2*b*b+b)+p1*(-2*b*b*b+3*b*b)+m1*(b*b*b-b*b);
+     q[j]=Project(p);double r=u>.90?.049*Math.Sqrt(Clamp(1-Math.Pow((u-.90)/.10,2),0,1))+.004:.051-.014*u+.012*Math.Exp(-Math.Pow((u-.86)/.08,2));rad[j]=r*scale*7/(7+q[j].Z);
+     minx=Math.Min(minx,(int)Math.Floor(q[j].X-rad[j]));maxx=Math.Max(maxx,(int)Math.Ceiling(q[j].X+rad[j]));miny=Math.Min(miny,(int)Math.Floor(q[j].Y-rad[j]/1.5));maxy=Math.Max(maxy,(int)Math.Ceiling(q[j].Y+rad[j]/1.5));}
+    double fade=Clamp(1.1-.7*(rest[i,0].Z-.40+.80)/1.60,.30,1);
+    int xlo=Math.Max(0,minx),xhi=Math.Min(W-1,maxx),ylo=Math.Max(0,miny),yhi=Math.Min(Ht-1,maxy);
+    for(int y=ylo;y<=yhi;y++)for(int x=xlo;x<=xhi;x++){int id=y*W+x;tubeBest[id]=1;tubeIndex[id]=-1;}
+    // Visit only the cells within each sample's radius; preserve original sample order and distance test.
+    for(int j=0;j<90;j++){double r=rad[j],rr=r*r;int xa=Math.Max(xlo,(int)Math.Floor(q[j].X-r-.5)),xb=Math.Min(xhi,(int)Math.Ceiling(q[j].X+r-.5));int ya=Math.Max(ylo,(int)Math.Floor(q[j].Y-r/1.5-.5)),yb=Math.Min(yhi,(int)Math.Ceiling(q[j].Y+r/1.5-.5));
+     for(int y=ya;y<=yb;y++){double dy=(y+.5-q[j].Y)*1.5;for(int x=xa;x<=xb;x++){double dx=x+.5-q[j].X,d=(dx*dx+dy*dy)/rr;int id=y*W+x;if(d<tubeBest[id]){tubeBest[id]=d;tubeIndex[id]=j;}}}}
+    for(int y=ylo;y<=yhi;y++)for(int x=xlo;x<=xhi;x++){
+     int id=y*W+x,jbest=tubeIndex[id];double best=tubeBest[id],ox=jbest<0?0:x+.5-q[jbest].X,oy=jbest<0?0:(y+.5-q[jbest].Y)*1.5;
+     if(jbest<0)continue;int index=y*W+x;if(q[jbest].Z>=depth[index])continue;
+     double tip=Ease((jbest/89.0-.30)/.62),lit=Clamp(.5-.5*(ox*.8+oy*.6)/rad[jbest],0,1);bool rim=best>.49;V tone=Mix(new V(112,94,160),new V(186,228,236),tip)*fade;
+     double glow=touch[i,Math.Min(13,(int)(jbest*13.0/89))]*(.25+.75*tip);double value=.14+.24*lit+.42*tip*tip+.25*glow;string fill=".::;;ioo08";char glyph=rim?Direction(-oy,ox/1.5):fill[(int)Clamp(value*1.25*fill.Length,0,fill.Length-1)];
+     V col=tone*(rim?(.50+.38*lit+.22*tip)*(Math.Sin(jbest*.9+i*2.1)>-.86?1:.45):.16+.26*lit+.5*tip*tip);PutScreen(new V(x+.5,y+.5,q[jbest].Z),glyph,col+new V(204,255,247)*(glow*(rim?.35:.20)),3);
+    }
+   }
+  }
+  public void Frame(double t){time=(t%Loop+Loop)%Loop;for(int i=0;i<Ch.Length;i++){Ch[i]=' ';Ink[i]=0;depth[i]=99;owner[i]=0;}
+   SwimState st=At(time),prev=At(time-.04);place=st.P;yaw=PI-st.A+.05*(.4+st.E)*Math.Sin(st.Phi+.8);pitch=-st.T;effort=Math.Min(.5+1.25*st.E,2);hz=.70+1.05*st.E;beat=st.Phi;turn=Clamp(.11*Math.Atan2(Math.Sin(st.A-prev.A),Math.Cos(st.A-prev.A))/.04,-.2,.2);brake=Clamp(1.6*(prev.V-st.V)/.04,0,.7);
+   spine[0]=0;for(int i=1;i<76;i++){double x=i*.02,sl=(Sway(x+.001,0)-Sway(x-.001,0))/.002;spine[i]=spine[i-1]+.02/Math.Sqrt(1+sl*sl);}
+   cam=new V();for(int i=0;i<12;i++)cam+=Curve(time-i*.065)*(1.0/12);cam.Y=cam.Y*.62-.10;cam.X+=.11*Math.Cos(st.A);swing=.24*(cam.X-.05);tilt=-.22*(cam.Y-.15);scale=W*(55.0/90)*(1+.12*(1-Clamp(st.V,0,1)));cyaw=Math.Cos(yaw);syaw=Math.Sin(yaw);cpitch=Math.Cos(pitch);spitch=Math.Sin(pitch);cswing=Math.Cos(swing);sswing=Math.Sin(swing);ctilt=Math.Cos(tilt);stilt=Math.Sin(tilt);centre=View(cam);scale*=Math.Pow((7+centre.Z)/7,.85);
+   for(int i=0;i<motes.Length;i++){V p=motes[i]+new V(.05*Math.Sin(time*Tau/Loop+i),.04*Math.Cos(time*Tau/Loop+i),0);double f=.5+.5*Math.Sin(i*1.9+time*Tau/Loop*3);Put(p,i%41==0?'+':'.',new V(22,46,60)*(.25+.75*f),4);}
+   // Sparse sand and rounded rock rather than a flat field of punctuation.
+   for(int i=-34;i<=34;i++)for(int j=-12;j<42;j++){double h=Math.Abs(Math.Sin(i*127.1+j*311.7)*43758.5453);h-=Math.Floor(h);if(h<.52)continue;double x=i*.13,z=j*.13;Put(new V(x,-1.42+.03*Math.Sin(x*1.7+z),z),'.',new V(60,50,35)*Clamp(1-(z+1.5)/6.5,.15,1),4);}
+   for(int i=0;i<46;i++)for(int j=0;j<110;j++){double a=.02+1.55*i/45,b=Tau*j/110;V n=new V(Math.Sin(a)*Math.Cos(b),Math.Cos(a),Math.Sin(a)*Math.Sin(b));double l=Clamp(n.Dot(Light),0,1);Put(new V(.05+1.5*n.X,-1.42+.44*n.Y,.42+1.1*n.Z),l>.5?':':'.',new V(104,116,150)*(.20+.50*l),4);}
+   for(int i=0;i<40;i++)for(int j=0;j<120;j++){double a=.02+1.55*i/39,b=Tau*j/120;V n=new V(Math.Sin(a)*Math.Cos(b),Math.Cos(a),Math.Sin(a)*Math.Sin(b));double l=Clamp(n.Dot(Light),0,1);Put(new V(.05+1.1*n.X,-1.08+.36*n.Y,.40+.8*n.Z),l>.5?':':'.',new V(112,94,160)*(.14+.30*l),4);}
+   Fish();
+   for(int y=0;y<Ht;y++)for(int x=0;x<W;x++){int i=y*W+x;if(owner[i]!=1)continue;bool up=y==0||owner[i-W]!=1,down=y==Ht-1||owner[i+W]!=1,left=x==0||owner[i-1]!=1,right=x==W-1||owner[i+1]!=1;bool fin=(y>0&&owner[i-W]==2)||(y<Ht-1&&owner[i+W]==2)||(x>0&&owner[i-1]==2)||(x<W-1&&owner[i+1]==2);if(!fin){if(up&&left||down&&right)Ch[i]='/';else if(up&&right||down&&left)Ch[i]='\\';else if(up)Ch[i]='-';else if(down)Ch[i]='_';else if(left)Ch[i]='(';else if(right)Ch[i]=')';}}
+   Reef();
+   if(st.Age>=0){V q=Project(st.Food);PutScreen(q,'@',new V(255,214,107),4);}
+   for(int k=0;k<6;k++){beamFoot[k]=W*.5+.85*scale*(-2.6+1.2*k+.22*Math.Sin(3*Tau*time/Loop+1.7*k)-cam.X-1.6*swing);beamWide[k]=W*(60+22*Math.Sin(4*Tau*time/Loop+2.3*k))/1080;beamAmp[k]=.65+.35*Math.Sin(8*Tau*time/Loop+1.1*k);}
+   for(int y=0;y<Ht;y++)for(int x=0;x<W;x++){int i=y*W+x;double light=0;for(int k=0;k<6;k++){double lean=beamFoot[k]-.45*(y-Ht*.49);light+=beamAmp[k]*Math.Exp(-Math.Pow((x-lean)/beamWide[k],2));}light*=Clamp(1.15-.55*y/Ht,.3,1);int col=Ink[i];if(Ch[i]==' '&&light>.30&&(y*2+x)%5==0){Ch[i]='/';Ink[i]=RGB(new V(46,84,108)*light);}else if(Ch[i]!=' ')Ink[i]=RGB(new V(col>>16,(col>>8)&255,col&255)*(1+.42*light));}
+  }
+  public string Ansi(){StringBuilder b=new StringBuilder(Ch.Length*12);b.Append("\u001b[H");int last=-1;for(int y=0;y<Ht;y++){for(int x=0;x<W;x++){int i=y*W+x,c=Ink[i];if(c!=last&&Ch[i]!=' '){b.Append("\u001b[38;2;").Append(c>>16).Append(';').Append((c>>8)&255).Append(';').Append(c&255).Append('m');last=c;}b.Append(Ch[i]);}if(y<Ht-1)b.Append("\r\n");}return b.Append("\u001b[0m").ToString();}
+  // Font atlas is provided by WPF. Render text into a single BGRA buffer, plus a restrained halo.
+  byte[] pixelBuffer; float[] smallBuffer,nearBuffer,farBuffer,blurTemp,horizontal;
+  public byte[] Pixels(byte[] atlas,int cw,int ch,bool glow){
+   int width=W*cw,height=Ht*ch,sw=(width+3)/4,sh=(height+3)/4;
+   if(pixelBuffer==null||pixelBuffer.Length!=width*height*4)pixelBuffer=new byte[width*height*4];
+   byte[] p=pixelBuffer;Array.Clear(p,0,p.Length);for(int i=3;i<p.Length;i+=4)p[i]=255;
+   if(glow){if(smallBuffer==null||smallBuffer.Length!=sw*sh*3){smallBuffer=new float[sw*sh*3];nearBuffer=new float[smallBuffer.Length];farBuffer=new float[smallBuffer.Length];blurTemp=new float[smallBuffer.Length];}if(horizontal==null||horizontal.Length!=width*sh*3)horizontal=new float[width*sh*3];Array.Clear(smallBuffer,0,smallBuffer.Length);}
+   for(int y=0;y<Ht;y++)for(int x=0;x<W;x++){int cell=y*W+x,c=Ink[cell],g=Ch[cell]-32;if(g<=0||g>=95)continue;int blue=c&255,green=(c>>8)&255,red=(c>>16)&255;
+    for(int yy=0;yy<ch;yy++){int row=y*ch+yy,off=(g*ch+yy)*cw;for(int xx=0;xx<cw;xx++){int mask=atlas[off+xx];if(mask==0)continue;int col=x*cw+xx,index=(row*width+col)*4;byte b=(byte)(blue*mask/255),gr=(byte)(green*mask/255),r=(byte)(red*mask/255);p[index]=b;p[index+1]=gr;p[index+2]=r;
+     if(glow){int j=((row/4)*sw+col/4)*3;smallBuffer[j]+=b/16f;smallBuffer[j+1]+=gr/16f;smallBuffer[j+2]+=r/16f;}}}}
+   if(glow){Blur(smallBuffer,sw,sh,3,blurTemp,nearBuffer);Blur(smallBuffer,sw,sh,12,blurTemp,farBuffer);
+    // Bilinear interpolation is linear: combine the two halos at low resolution first.
+    for(int i=0;i<nearBuffer.Length;i++)nearBuffer[i]=.6f*nearBuffer[i]+.5f*farBuffer[i];
+    System.Threading.Tasks.Parallel.For(0,sh,y=>{int row=y*sw*3,dst=y*width*3;for(int x=0;x<width;x++){int a=row+(x/4)*3,b=row+Math.Min(x/4+1,sw-1)*3;float u=(x%4)*.25f;for(int k=0;k<3;k++)horizontal[dst+x*3+k]=nearBuffer[a+k]*(1-u)+nearBuffer[b+k]*u;}});
+    System.Threading.Tasks.Parallel.For(0,height,y=>{int a=(y/4)*width*3,b=Math.Min(y/4+1,sh-1)*width*3,i=y*width*4;float v=(y%4)*.25f;for(int x=0;x<width;x++,i+=4,a+=3,b+=3){for(int k=0;k<3;k++)p[i+k]=(byte)Math.Min(255,p[i+k]+horizontal[a+k]*(1-v)+horizontal[b+k]*v);}});
+   }return p;
+  }
+  static void Blur(float[] src,int w,int h,int r,float[] tmp,float[] dst){int span=2*r+1;for(int y=0;y<h;y++)for(int k=0;k<3;k++){float sum=0;for(int j=-r;j<=r;j++)sum+=src[(y*w+Math.Max(0,Math.Min(w-1,j)))*3+k];for(int x=0;x<w;x++){tmp[(y*w+x)*3+k]=sum/span;sum+=src[(y*w+Math.Min(w-1,x+r+1))*3+k]-src[(y*w+Math.Max(0,x-r))*3+k];}}for(int x=0;x<w;x++)for(int k=0;k<3;k++){float sum=0;for(int j=-r;j<=r;j++)sum+=tmp[(Math.Max(0,Math.Min(h-1,j))*w+x)*3+k];for(int y=0;y<h;y++){dst[(y*w+x)*3+k]=sum/span;sum+=tmp[(Math.Min(h-1,y+r+1)*w+x)*3+k]-tmp[(Math.Max(0,y-r)*w+x)*3+k];}}}
+  public string Check(){int[] counts=new int[4];foreach(double t in new double[]{0,5,11,17,21.99}){Frame(t);Array.Clear(counts,0,4);for(int i=0;i<Ch.Length;i++){if(Ch[i]<32||Ch[i]>126)throw new Exception("Invalid ASCII glyph");if(owner[i]>0&&owner[i]<4)counts[owner[i]]++;}if(counts[1]+counts[2]<10||counts[3]<10)throw new Exception("Insufficient visible geometry at "+t);}
+   Frame(0);string a=new string(Ch);Frame(22);if(a!=new string(Ch))throw new Exception("Loop mismatch");return "PASS: five frames, visible geometry, ASCII range and loop closure. Physical lap: "+lapSeconds.ToString("F3")+" s";}
+ }
+}
+'@ -ErrorAction Stop
+ }
+ if($SelfTest){ $r=[ClownfishV42.Renderer]::new($Width,$Height); return $r.Check() }
+ if($Mode -eq 'Terminal'){
+  if([Console]::IsOutputRedirected -or [Console]::IsInputRedirected -or $Host.Name -match 'ISE'){throw 'Use an interactive ANSI-capable terminal.'}
+  $w=[Math]::Min($Width,[Console]::WindowWidth-1);$h=[Math]::Min($Height,[Console]::WindowHeight-1)
+  if($w -lt 40 -or $h -lt 25){throw 'Enlarge the terminal to at least 41 columns by 26 rows.'}
+  $r=[ClownfishV42.Renderer]::new($w,$h);$e=[string][char]27;$sw=[Diagnostics.Stopwatch]::StartNew();$next=0.0;$stats=[ClownfishV42.FrameStats]::new();$oldTitle=[Console]::Title
+  try{[Console]::Write("$e[?1049h$e[?25l$e[40m$e[2J");while($Duration -eq 0 -or $sw.Elapsed.TotalSeconds -lt $Duration){
+   if([Console]::KeyAvailable){$key=[Console]::ReadKey($true).Key;if($key -in @('Escape','Q')){break}}
+   if([Console]::WindowWidth -le $w -or [Console]::WindowHeight -le $h){break}
+   $begin=$sw.Elapsed.TotalSeconds;$r.Frame($begin);$mid=$sw.Elapsed.TotalSeconds;[Console]::Write($r.Ansi());$end=$sw.Elapsed.TotalSeconds;if($Diagnostics){$report=$stats.Record($end,($end-$begin),($mid-$begin),0,($end-$mid));if($report){[Console]::Title="ASCII Clownfish V4.2 | $report"}};$next=[Math]::Max($next+1.0/$FPS,$sw.Elapsed.TotalSeconds);$ms=[int](1000*($next-$sw.Elapsed.TotalSeconds));if($ms -gt 0){Start-Sleep -Milliseconds $ms}
+  }}finally{[Console]::Write("$e[0m$e[?25h$e[?1049l");if($Diagnostics){[Console]::Title=$oldTitle}};return
+ }
+ if([Environment]::OSVersion.Platform -ne 'Win32NT'){throw 'Window mode requires Windows.'}
+ if([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA'){throw 'Start PowerShell with -STA for Window mode.'}
+ Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase -ErrorAction Stop
+ $cw=12;$ch=18;$r=[ClownfishV42.Renderer]::new($Width,$Height)
+ $atlas=New-Object byte[] (95*$cw*$ch)
+ $font=[Windows.Media.Typeface]::new('Consolas');$culture=[Globalization.CultureInfo]::InvariantCulture
+ for($g=0;$g -lt 95;$g++){
+  $dv=[Windows.Media.DrawingVisual]::new();$dc=$dv.RenderOpen()
+  try{$ft=[Windows.Media.FormattedText]::new([string][char]($g+32),$culture,[Windows.FlowDirection]::LeftToRight,$font,20.0,[Windows.Media.Brushes]::White,1.0);$dc.DrawText($ft,[Windows.Point]::new(0, $(if($g -eq 63){-5}else{-3})))}finally{$dc.Close()}
+  $bm=[Windows.Media.Imaging.RenderTargetBitmap]::new($cw,$ch,96,96,[Windows.Media.PixelFormats]::Pbgra32);$bm.Render($dv);$buf=New-Object byte[] ($cw*$ch*4);$bm.CopyPixels($buf,$cw*4,0)
+  for($i=0;$i -lt $cw*$ch;$i++){$atlas[$g*$cw*$ch+$i]=$buf[$i*4+3]}
+ }
+ $pixelW=$Width*$cw;$pixelH=$Height*$ch
+ $bitmap=[Windows.Media.Imaging.WriteableBitmap]::new($pixelW,$pixelH,96,96,[Windows.Media.PixelFormats]::Bgra32,$null)
+ $image=[Windows.Controls.Image]::new();$image.Source=$bitmap;$image.Stretch='Uniform';[Windows.Media.RenderOptions]::SetBitmapScalingMode($image,'HighQuality')
+ $window=[Windows.Window]::new();$window.Title='ASCII Clownfish V4.2 | Esc / Q to close';$window.Background=[Windows.Media.Brushes]::Black;$window.Content=$image;$window.Width=760;$window.Height=850;$window.WindowStartupLocation='CenterScreen'
+ $clock=[Diagnostics.Stopwatch]::new();$rect=[Windows.Int32Rect]::new(0,0,$pixelW,$pixelH)
+ $stats=[ClownfishV42.FrameStats]::new();$glow=-not $NoGlow.IsPresent
+ $tick={param($sender,$eventArgs) try{
+   $now=$clock.Elapsed.TotalSeconds
+   if($Duration -gt 0 -and $now -ge $Duration){$window.Close();return}
+   if(-not $stats.Due($now,$FPS)){return}
+   $r.Frame($now);$gdone=$clock.Elapsed.TotalSeconds;$pixels=$r.Pixels($atlas,$cw,$ch,$glow);$pdone=$clock.Elapsed.TotalSeconds;$bitmap.WritePixels($rect,$pixels,$pixelW*4,0)
+   if($Diagnostics){$done=$clock.Elapsed.TotalSeconds;$report=$stats.Record($done,($done-$now),($gdone-$now),($pdone-$gdone),($done-$pdone));if($report){$window.Title="ASCII Clownfish V4.2 | $report"}}
+  }catch{$window.Close();Write-Error $_}}.GetNewClosure()
+ $handler=[EventHandler]$tick
+ $window.Add_KeyDown({param($sender,$eventArgs) if($eventArgs.Key -in @('Escape','Q')){$sender.Close()}})
+ try{$clock.Start();[Windows.Media.CompositionTarget]::add_Rendering($handler);[void]$window.ShowDialog()}finally{[Windows.Media.CompositionTarget]::remove_Rendering($handler);$clock.Stop()}
+
+}
+# Dot-source to load without starting: . .\Show-AsciiClownfish
+if($MyInvocation.InvocationName -ne '.') { Show-AsciiClownfish @PSBoundParameters }
